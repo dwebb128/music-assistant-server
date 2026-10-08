@@ -1330,18 +1330,22 @@ class PlexProvider(RecommendationPayloadMixin, MusicProvider):
             raise MediaNotFoundError(ERR_ITEM_NOT_FOUND.format(item_id=key)) from err
         return cast("PlexObjectT", results)
 
-    async def _load_full_metadata(self, items: list[PlexObjectT]) -> AsyncGenerator[PlexObjectT]:
+    async def _load_full_metadata(
+        self, items: list[PlexObjectT], params: dict[str, Any] | None = None
+    ) -> AsyncGenerator[PlexObjectT]:
         """
         Yield the given listing results with their full metadata, in the same order.
 
         :param items: Partial objects as returned by a library listing.
+        :param params: Include params to request, defaults to everything plexapi includes.
         """
-        # the include params plexapi itself sends when it reloads a single item
-        params = {
-            key: value
-            for key, value in PlexPartialObject._INCLUDES.items()
-            if value not in (False, 0, "0")
-        }
+        if params is None:
+            # the include params plexapi itself sends when it reloads a single item
+            params = {
+                key: value
+                for key, value in PlexPartialObject._INCLUDES.items()
+                if value not in (False, 0, "0")
+            }
         for start in range(0, len(items), METADATA_BATCH_SIZE):
             chunk = items[start : start + METADATA_BATCH_SIZE]
             full_items = await self._run_async(
@@ -1878,27 +1882,62 @@ class PlexProvider(RecommendationPayloadMixin, MusicProvider):
         return audiobook
 
     async def _build_audiobook_chapters(self, plex_album: PlexAlbum) -> list[MediaItemChapter]:
-        """Build chapter list from Plex tracks, skipping tracks without playable media."""
+        """
+        Build the chapter list of an audiobook, skipping tracks without playable media.
+
+        A track that carries chapter markers inside its file (e.g. a single-file m4b) adds
+        one chapter per marker, any other track adds a single chapter for the whole track.
+        """
         plex_tracks = cast("list[PlexTrack]", await self._run_async(plex_album.tracks))
+        # the children listing has no chapter markers, so load them for all tracks at once
+        try:
+            plex_tracks = [
+                plex_track
+                async for plex_track in self._load_full_metadata(
+                    plex_tracks, params={"includeChapters": 1}
+                )
+            ]
+        except plexapi.exceptions.PlexApiException, requests.exceptions.RequestException:
+            self.logger.warning(
+                "Failed to load chapter markers for %s, using one chapter per track",
+                plex_album.title,
+                exc_info=True,
+            )
+        for plex_track in plex_tracks:
+            # an item missing from the full metadata must not reload itself one by one
+            plex_track._autoReload = False
         plex_tracks.sort(key=lambda t: (t.parentIndex or 0, t.trackNumber or 0))
         chapters: list[MediaItemChapter] = []
         cumulative = 0.0
-        chapter_num = 0
         for plex_track in plex_tracks:
             if not plex_track.media or not plex_track.media[0].parts:
                 continue
-            chapter_num += 1
             # plex_track.duration is in milliseconds (Plex native unit)
             duration_s = (plex_track.duration or 0) / 1000.0
-            chapters.append(
-                MediaItemChapter(
-                    position=chapter_num,
-                    name=plex_track.title or f"{CHAPTER_PREFIX} {chapter_num}",
-                    start=cumulative,
-                    end=cumulative + duration_s,
+            markers = self._get_embedded_chapter_markers(plex_track)
+            if markers:
+                for name, start, end in markers:
+                    position = len(chapters) + 1
+                    chapters.append(
+                        MediaItemChapter(
+                            position=position,
+                            name=name or f"{CHAPTER_PREFIX} {position}",
+                            start=cumulative + start,
+                            end=cumulative + end,
+                        )
+                    )
+            else:
+                position = len(chapters) + 1
+                chapters.append(
+                    MediaItemChapter(
+                        position=position,
+                        name=plex_track.title or f"{CHAPTER_PREFIX} {position}",
+                        start=cumulative,
+                        end=cumulative + duration_s,
+                    )
                 )
-            )
-            cumulative += duration_s
+            # a track without a known duration still lasts as long as its chapters
+            cumulative += duration_s or (markers[-1][2] if markers else 0.0)
         return chapters
 
     async def _parse_podcast(
@@ -2019,6 +2058,43 @@ class PlexProvider(RecommendationPayloadMixin, MusicProvider):
         if plex_track.summary:
             episode.metadata.description = plex_track.summary
         return episode
+
+    @staticmethod
+    def _get_embedded_chapter_markers(
+        plex_track: PlexTrack,
+    ) -> list[tuple[str | None, float, float]]:
+        """
+        Return the usable chapter markers embedded in a track's file.
+
+        Returns an empty list when the file has fewer than two usable markers, in which case
+        the whole track makes up a single chapter.
+
+        :param plex_track: Fully loaded Plex track.
+        :return: (name, start, end) per marker, in seconds relative to the start of the track.
+        """
+        duration_ms = plex_track.duration or 0
+        usable: list[tuple[str | None, int, int | None]] = []
+        for chapter in sorted(plex_track.chapters or [], key=lambda c: c.start or 0):
+            start_ms = max(chapter.start or 0, 0)
+            if chapter.end is not None and chapter.end <= start_ms:
+                continue
+            if duration_ms and start_ms >= duration_ms:
+                continue
+            if usable and usable[-1][1] == start_ms:
+                continue
+            usable.append((chapter.tag, start_ms, chapter.end))
+        if len(usable) < 2:
+            return []
+        last_end_ms = duration_ms or usable[-1][2]
+        if not last_end_ms:
+            return []
+        # many files only store where each chapter starts, so every chapter runs up to the
+        # next one, the first covers the start of the file and the last runs to its end
+        markers: list[tuple[str | None, float, float]] = []
+        for index, (name, start_ms, _end_ms) in enumerate(usable):
+            end_ms = usable[index + 1][1] if index + 1 < len(usable) else last_end_ms
+            markers.append((name, 0.0 if index == 0 else start_ms / 1000.0, end_ms / 1000.0))
+        return markers
 
     async def _calc_resume_position_ms(self, plex_album: PlexAlbum, fully_played: bool) -> int:
         """Calculate resume position from per-track viewOffset values."""
