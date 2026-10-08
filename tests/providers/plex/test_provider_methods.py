@@ -350,7 +350,7 @@ class TestBuildAudiobookChapters:
         ]
         fetch = audiobook_provider._plex_library.fetchItems
         assert fetch.call_count == 1
-        assert fetch.call_args.kwargs["params"]["includeChapters"] == 1
+        assert fetch.call_args.kwargs["params"] == {"includeChapters": 1}
 
     @pytest.mark.asyncio
     async def test_multi_file_without_embedded_chapters(self, audiobook_provider: Any) -> None:
@@ -408,6 +408,81 @@ class TestBuildAudiobookChapters:
             (2, "Chapter A", 100.0, 500.0),
             (3, "Chapter B", 500.0, 1100.0),
             (4, "Outro", 1100.0, 1150.0),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_start_only_markers_run_to_next_marker(self, audiobook_provider: Any) -> None:
+        """Markers without an end run up to the next marker instead of to the end of the file."""
+        album = _make_audiobook_album(
+            audiobook_provider,
+            {
+                "key": "/1",
+                "title": "Book",
+                "duration": 3_600_000,
+                "chapters": [
+                    _marker(0, None, "One"),
+                    _marker(600_000, None, "Two"),
+                    _marker(2_000_000, None, "Three"),
+                ],
+            },
+        )
+        chapters = await audiobook_provider._build_audiobook_chapters(album)
+
+        assert [(c.name, c.start, c.end) for c in chapters] == [
+            ("One", 0.0, 600.0),
+            ("Two", 600.0, 2000.0),
+            ("Three", 2000.0, 3600.0),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_overlapping_markers_do_not_overlap(self, audiobook_provider: Any) -> None:
+        """Chapters never overlap or leave a gap, whatever the markers' own offsets say."""
+        album = _make_audiobook_album(
+            audiobook_provider,
+            {
+                "key": "/1",
+                "title": "Book",
+                "duration": 1_000_000,
+                "chapters": [
+                    # the first marker starts after the beginning of the file
+                    _marker(5_000, 500_000, "One"),
+                    _marker(300_000, 800_000, "Two"),
+                    # same start as the previous marker
+                    _marker(300_000, 400_000, "Duplicate"),
+                    # starts past the end of the file
+                    _marker(1_200_000, None, "Beyond"),
+                ],
+            },
+        )
+        chapters = await audiobook_provider._build_audiobook_chapters(album)
+
+        assert [(c.name, c.start, c.end) for c in chapters] == [
+            ("One", 0.0, 300.0),
+            ("Two", 300.0, 1000.0),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_markers_offset_next_track_without_duration(
+        self, audiobook_provider: Any
+    ) -> None:
+        """A file without a duration still pushes the next file back by its chapters' length."""
+        album = _make_audiobook_album(
+            audiobook_provider,
+            {
+                "key": "/1",
+                "title": "Part 1",
+                "duration": None,
+                "track_number": 1,
+                "chapters": [_marker(0, 1_000_000, "A"), _marker(1_000_000, 3_000_000, "B")],
+            },
+            {"key": "/2", "title": "Part 2", "duration": 60_000, "track_number": 2},
+        )
+        chapters = await audiobook_provider._build_audiobook_chapters(album)
+
+        assert [(c.name, c.start, c.end) for c in chapters] == [
+            ("A", 0.0, 1000.0),
+            ("B", 1000.0, 3000.0),
+            ("Part 2", 3000.0, 3060.0),
         ]
 
     @pytest.mark.asyncio
