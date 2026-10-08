@@ -99,6 +99,7 @@ class FakePlexTrack:
         parent_key: str = "/library/metadata/100",
     ) -> None:
         self.key = key
+        self.ratingKey = key
         self.title = title
         self.duration = duration
         self.parentIndex = parent_index
@@ -107,6 +108,7 @@ class FakePlexTrack:
         self.viewOffset = view_offset
         self.viewCount = 0
         self.summary = ""
+        self.chapters: list[Any] = []
         if has_media:
             media = MagicMock()
             media.container = container
@@ -197,6 +199,32 @@ def _make_tracks(*specs: dict[str, Any]) -> list[FakePlexTrack]:
 def _make_album(tracks: list[Any], **kwargs: Any) -> FakePlexAlbum:
     """Build a FakePlexAlbum with the given tracks."""
     return FakePlexAlbum(tracks, **kwargs)
+
+
+def _marker(start: int | None, end: int | None, tag: str | None = None) -> MagicMock:
+    """Build a Plex chapter marker stub (offsets in milliseconds)."""
+    return MagicMock(start=start, end=end, tag=tag, title=tag)
+
+
+def _make_audiobook_album(provider: Any, *specs: dict[str, Any]) -> FakePlexAlbum:
+    """
+    Build an audiobook album whose children listing carries no chapter markers.
+
+    Only the full metadata request the provider makes returns the tracks with their markers,
+    like a real Plex server.
+
+    :param provider: Provider whose full metadata request should return the tracks.
+    :param specs: FakePlexTrack specs, in album order.
+    """
+    track_specs = [{k: v for k, v in spec.items() if k != "chapters"} for spec in specs]
+    full_tracks: dict[str, FakePlexTrack] = {}
+    for spec, track in zip(specs, _make_tracks(*track_specs), strict=True):
+        track.chapters = spec.get("chapters", [])
+        full_tracks[track.ratingKey] = track
+    provider._plex_library.fetchItems = MagicMock(
+        side_effect=lambda keys, **_kwargs: [full_tracks[key] for key in keys]
+    )
+    return _make_album(_make_tracks(*track_specs))
 
 
 def _make_stream_track(container: str = "flac", has_audio_streams: bool = True) -> MagicMock:
@@ -294,6 +322,106 @@ class TestBuildAudiobookChapters:
         assert chapters[1].end == 3.0
         assert chapters[2].start == 3.0
         assert chapters[2].end == 6.0
+
+    @pytest.mark.asyncio
+    async def test_single_file_with_embedded_chapters(self, audiobook_provider: Any) -> None:
+        """A single-file book gets one chapter per marker embedded in the file."""
+        album = _make_audiobook_album(
+            audiobook_provider,
+            {
+                "key": "/1",
+                "title": "Book",
+                "duration": 3_600_000,
+                "container": "m4b",
+                "chapters": [
+                    _marker(0, 600_000, "Opening Credits"),
+                    _marker(600_000, 2_000_000, "One"),
+                    _marker(2_000_000, 3_590_000, None),
+                ],
+            },
+        )
+        chapters = await audiobook_provider._build_audiobook_chapters(album)
+
+        assert [(c.position, c.name, c.start, c.end) for c in chapters] == [
+            (1, "Opening Credits", 0.0, 600.0),
+            (2, "One", 600.0, 2000.0),
+            # an unnamed marker gets the default name, the last one runs to the end of the file
+            (3, "Chapter 3", 2000.0, 3600.0),
+        ]
+        fetch = audiobook_provider._plex_library.fetchItems
+        assert fetch.call_count == 1
+        assert fetch.call_args.kwargs["params"]["includeChapters"] == 1
+
+    @pytest.mark.asyncio
+    async def test_multi_file_without_embedded_chapters(self, audiobook_provider: Any) -> None:
+        """Files without markers keep making up one chapter each, in one extra request."""
+        album = _make_audiobook_album(
+            audiobook_provider,
+            *[
+                {"key": f"/{i}", "title": f"Part {i}", "duration": 60_000, "track_number": i}
+                for i in range(1, 121)
+            ],
+        )
+        chapters = await audiobook_provider._build_audiobook_chapters(album)
+
+        assert len(chapters) == 120
+        assert [c.name for c in chapters[:2]] == ["Part 1", "Part 2"]
+        assert (chapters[-1].position, chapters[-1].start, chapters[-1].end) == (
+            120,
+            7140.0,
+            7200.0,
+        )
+        assert audiobook_provider._plex_library.fetchItems.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_mixed_files_offset_embedded_chapters(self, audiobook_provider: Any) -> None:
+        """Embedded markers are shifted by their file's offset within the book."""
+        album = _make_audiobook_album(
+            audiobook_provider,
+            {"key": "/1", "title": "Intro", "duration": 100_000, "track_number": 1},
+            {
+                "key": "/2",
+                "title": "Part 1",
+                "duration": 1_000_000,
+                "track_number": 2,
+                "chapters": [
+                    _marker(0, 400_000, "Chapter A"),
+                    # zero-length and backwards markers are skipped
+                    _marker(400_000, 400_000, "Empty"),
+                    _marker(500_000, 450_000, "Backwards"),
+                    _marker(400_000, 1_200_000, "Chapter B"),
+                ],
+            },
+            # a single marker adds nothing over the track itself
+            {
+                "key": "/3",
+                "title": "Outro",
+                "duration": 50_000,
+                "track_number": 3,
+                "chapters": [_marker(0, 50_000, "Only")],
+            },
+        )
+        chapters = await audiobook_provider._build_audiobook_chapters(album)
+
+        assert [(c.position, c.name, c.start, c.end) for c in chapters] == [
+            (1, "Intro", 0.0, 100.0),
+            (2, "Chapter A", 100.0, 500.0),
+            (3, "Chapter B", 500.0, 1100.0),
+            (4, "Outro", 1100.0, 1150.0),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_chapters_fall_back_when_markers_fail(self, audiobook_provider: Any) -> None:
+        """When the markers cannot be loaded, each track becomes one chapter as before."""
+        tracks = _make_tracks({"key": "/1", "title": "Book", "duration": 3_600_000})
+        audiobook_provider._plex_library.fetchItems = MagicMock(
+            side_effect=plexapi.exceptions.BadRequest("boom")
+        )
+        chapters = await audiobook_provider._build_audiobook_chapters(_make_album(tracks))
+
+        assert [(c.position, c.name, c.start, c.end) for c in chapters] == [
+            (1, "Book", 0.0, 3600.0)
+        ]
 
 
 class TestBuildPodcastEpisodes:
