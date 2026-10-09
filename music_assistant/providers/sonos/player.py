@@ -31,7 +31,11 @@ from music_assistant_models.enums import (
     PlayerFeature,
     RepeatMode,
 )
-from music_assistant_models.errors import PlayerCommandFailed, PlayerUnavailableError
+from music_assistant_models.errors import (
+    MusicAssistantError,
+    PlayerCommandFailed,
+    PlayerUnavailableError,
+)
 from music_assistant_models.player import OutputProtocol, PlayerMedia
 
 from music_assistant.constants import (
@@ -138,6 +142,11 @@ class SonosPlayer(Player):
         # failures already logged, so the speaker's resends are not logged again
         self.reported_playback_errors: deque[str] = deque(maxlen=REPORTED_ERROR_HISTORY)
         self._announcement_media: PlayerMedia | None = None
+        # the MA queue the speaker holds paused: the speaker can not resume our stream
+        # itself, so a resume it starts on its own is handed to this queue instead
+        self._paused_queue_id: str | None = None
+        # set from handing such a resume over until the queue reloads the speaker
+        self._device_resume_pending = False
 
     @property
     def source_list(self) -> list[PlayerSource]:
@@ -355,6 +364,8 @@ class SonosPlayer(Player):
         await self.group_controller.stop()
         self.cloud_queue_id = None
         self._announcement_media = None
+        self._paused_queue_id = None
+        self._device_resume_pending = False
         self.update_state()
 
     async def pause(self) -> None:
@@ -375,6 +386,8 @@ class SonosPlayer(Player):
             # TODO: revisit this later once we implemented support for range requests
             # as I have the feeling the pause issue is related to seek support (=range requests)
             await self.stop()
+            # a resume from the speaker's own controls must still find this queue
+            self._paused_queue_id = active_source
             return
         if not self.group_controller.playback_actions.can_pause:
             await self.stop()
@@ -466,6 +479,9 @@ class SonosPlayer(Player):
             )
         # for now always reset the active session
         self.group_controller.active_session_id = None
+        # whatever the speaker held paused is replaced by what we load now
+        self._paused_queue_id = None
+        self._device_resume_pending = False
         # what is playing stays described until its replacement is loaded below: there are
         # awaits in between, and an empty window served in that gap stops the current queue
         self._announcement_media = None
@@ -849,6 +865,8 @@ class SonosPlayer(Player):
             return
 
         # map playback state
+        was_playing = self._attr_playback_state == PlaybackState.PLAYING
+        paused_position = (self._attr_elapsed_time, self._attr_elapsed_time_last_updated)
         self._attr_playback_state = PLAYBACK_STATE_MAP[active_group.playback_state]
         self._attr_elapsed_time = active_group.position
 
@@ -902,16 +920,31 @@ class SonosPlayer(Player):
 
         self._reflect_source_play_modes(active_group)
 
+        if group_parent is None:
+            self._track_paused_cloud_queue(
+                was_playing, playing_our_queue=active_service == MusicService.MUSIC_ASSISTANT
+            )
+
+        # the speaker resumed on its own and plays a stream it can not continue, so it
+        # stays paused to us, at the paused position, until the queue has reloaded it
+        resume_pending = (
+            active_service == MusicService.MUSIC_ASSISTANT
+            and (group_parent or self)._device_resume_pending
+        )
+
         # special case: Sonos reports PAUSED state when MA stopped playback
-        if (
+        if resume_pending or (
             active_service == MusicService.MUSIC_ASSISTANT
             and self._attr_playback_state == PlaybackState.PAUSED
         ):
             self._attr_playback_state = PlaybackState.IDLE
 
         # parse current media
-        self._attr_elapsed_time = active_group.position
-        self._attr_elapsed_time_last_updated = time.time()
+        if resume_pending:
+            self._attr_elapsed_time, self._attr_elapsed_time_last_updated = paused_position
+        else:
+            self._attr_elapsed_time = active_group.position
+            self._attr_elapsed_time_last_updated = time.time()
         current_media = None
         if (current_item := active_group.playback_metadata.get("currentItem")) and (
             (track := current_item.get("track")) and track.get("name")
@@ -1010,6 +1043,9 @@ class SonosPlayer(Player):
 
     def update_elapsed_time(self, elapsed_time: float | None = None) -> None:
         """Update the elapsed time of the current media."""
+        if self._device_resume_pending:
+            # the position of a stream the speaker can not continue, not of our queue
+            return
         if elapsed_time is not None:
             self._attr_elapsed_time = elapsed_time
         last_updated = time.time()
@@ -1175,6 +1211,60 @@ class SonosPlayer(Player):
             shuffle_enabled=modes.shuffle,
             repeat_mode=repeat_mode,
         )
+
+    def _track_paused_cloud_queue(self, was_playing: bool, playing_our_queue: bool) -> None:
+        """
+        Remember the MA queue the speaker pauses, and resume it when the speaker plays again.
+
+        :param was_playing: Whether we reported the speaker as playing before this update.
+        :param playing_our_queue: Whether the speaker reports our cloud queue as loaded.
+        """
+        if not playing_our_queue:
+            # another service took over the speaker, so its pause no longer refers to us
+            self._paused_queue_id = None
+            return
+        if self._attr_playback_state == PlaybackState.PAUSED:
+            if was_playing and self.cloud_queue_id:
+                self._paused_queue_id = self.cloud_queue_id
+            return
+        if self._attr_playback_state != PlaybackState.PLAYING or not self._paused_queue_id:
+            return
+        # A pause from the speaker's own controls (or the Sonos app) leaves it holding a
+        # stream it can not continue: it abandons the item and reports it played to its
+        # end. Restart the queue at the paused position, as a resume from MA does.
+        queue_id = self._paused_queue_id
+        self._paused_queue_id = None
+        self._device_resume_pending = True
+        self.mass.create_task(
+            self._resume_paused_queue(queue_id),
+            task_id=f"sonos_resume_paused_queue_{self.player_id}",
+        )
+
+    async def _resume_paused_queue(self, queue_id: str) -> None:
+        """
+        Resume the MA queue the speaker resumed on its own.
+
+        :param queue_id: The queue the speaker held paused.
+        """
+        self.logger.debug(
+            "Speaker %s resumed queue %s on its own, restarting it at its paused position",
+            self.display_name,
+            queue_id,
+        )
+        try:
+            await self.mass.player_queues.resume(queue_id)
+        except MusicAssistantError as err:
+            self.logger.warning(
+                "Could not resume queue %s after %s resumed it: %s",
+                queue_id,
+                self.display_name,
+                err,
+            )
+        finally:
+            if self._device_resume_pending:
+                # the queue never reloaded the speaker, so stop holding it paused
+                self._device_resume_pending = False
+                self.update_state()
 
     def _on_playback_error(self, event: SonosEvent) -> None:
         """Log a playback failure the speaker reported for the item it tried to play."""
