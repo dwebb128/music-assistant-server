@@ -43,6 +43,8 @@ def _bind_player(mass: MusicAssistant | MagicMock) -> tuple[SonosPlayer, MagicMo
     player._wol_mac = None
     player._marked_asleep = False
     player._woken_from_sleep = False
+    player._paused_queue_id = None
+    player._device_resume_pending = False
     player.client = client
     player._on_unload_callbacks = []
     player.update_state = MagicMock()  # type: ignore[misc, method-assign]
@@ -964,3 +966,178 @@ async def test_set_members_gives_up_when_the_sonos_group_never_reports_the_membe
         await player.set_members(player_ids_to_add=["sonos_player_2"])
 
     assert client.player.group_members == [player.player_id]
+
+
+def _report_our_queue(group: MagicMock, state: SonosPlayBackState, position: float) -> None:
+    """Let the given group report our cloud queue in the given playback state."""
+    group.playback_state = state
+    group.position = position
+    group.container_type = "trackList"
+    group.active_service = MusicService.MUSIC_ASSISTANT
+    group.playback_metadata = {
+        "container": {"name": "Music Assistant", "service": {"name": "Music Assistant"}},
+        "currentItem": {"id": "book1@3", "track": {"name": "Long Book"}},
+    }
+
+
+def _speaker_playing_our_queue() -> tuple[SonosPlayer, MagicMock, MagicMock]:
+    """Create a coordinator that plays our cloud queue, with the queue resume recorded."""
+    player, mass, client = _connected_player()
+    player._cache = {}
+    player._attr_name = "Living Room"
+    player._config = MagicMock()
+    player._config.name = None
+    player.cloud_queue_id = "sonos_player"
+    client.player.is_coordinator = True
+    client.player.group_members = ["sonos_player"]
+    mass.player_queues.resume = AsyncMock()
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 1200.0)
+    player.on_player_event(None)
+    assert player._attr_playback_state is PlaybackState.PLAYING
+    return player, mass, client
+
+
+async def _run_scheduled_resume(mass: MagicMock) -> None:
+    """Run the resume task the player handed to the task machinery."""
+    mass.create_task.assert_called_once()
+    await mass.create_task.call_args.args[0]
+
+
+async def test_a_resume_from_the_speaker_restarts_the_queue_where_it_paused() -> None:
+    """Test a pause and resume on the speaker itself go through the queue's resume."""
+    player, mass, client = _speaker_playing_our_queue()
+
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PAUSED, 1300.0)
+    player.on_player_event(None)
+    assert player._attr_playback_state is PlaybackState.IDLE
+    mass.create_task.assert_not_called()
+
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 1300.0)
+    player.on_player_event(None)
+    # the speaker plays a stream it can not continue, so we do not follow it there
+    assert player._attr_playback_state is PlaybackState.IDLE
+    # it abandons that item and reports it played to its end, which must not count either
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 40000.0)
+    player.on_player_event(None)
+    player.update_elapsed_time(40000.0)
+    assert player._attr_playback_state is PlaybackState.IDLE
+    assert player._attr_elapsed_time == 1300.0
+
+    await _run_scheduled_resume(mass)
+    mass.player_queues.resume.assert_awaited_once_with("sonos_player")
+
+
+async def test_the_speaker_is_followed_again_once_the_queue_reloaded_it() -> None:
+    """Test the reload the resume makes ends holding the speaker paused."""
+    player, mass, client = _speaker_playing_our_queue()
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PAUSED, 1300.0)
+    player.on_player_event(None)
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 1300.0)
+    player.on_player_event(None)
+
+    # what play_media does before it loads the queue again
+    player._device_resume_pending = False
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 1.0)
+    player.on_player_event(None)
+
+    assert player._attr_playback_state is PlaybackState.PLAYING
+    mass.create_task.assert_called_once()
+    mass.create_task.call_args.args[0].close()
+
+
+async def test_a_failed_resume_stops_holding_the_speaker_paused() -> None:
+    """Test a resume the queue refuses does not leave the speaker reported as idle for good."""
+    player, mass, client = _speaker_playing_our_queue()
+    mass.player_queues.resume = AsyncMock(side_effect=PlayerUnavailableError("gone"))
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PAUSED, 1300.0)
+    player.on_player_event(None)
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 1300.0)
+    player.on_player_event(None)
+
+    await _run_scheduled_resume(mass)
+    player.on_player_event(None)
+
+    assert player._device_resume_pending is False
+    assert player._attr_playback_state is PlaybackState.PLAYING
+
+
+def test_a_fresh_load_is_not_taken_for_a_resume_from_the_speaker() -> None:
+    """Test playback the speaker did not pause first is left alone."""
+    player, mass, client = _speaker_playing_our_queue()
+
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_BUFFERING, 0.0)
+    player.on_player_event(None)
+
+    assert player._attr_playback_state is PlaybackState.PLAYING
+    mass.create_task.assert_not_called()
+
+
+def test_another_service_taking_over_forgets_the_paused_queue() -> None:
+    """Test a pause of our queue is not resumed once another service played on the speaker."""
+    player, mass, client = _speaker_playing_our_queue()
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PAUSED, 1300.0)
+    player.on_player_event(None)
+
+    _report_paused_spotify(client.player.group)
+    client.player.group.playback_state = SonosPlayBackState.PLAYBACK_STATE_PLAYING
+    player.on_player_event(None)
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 0.0)
+    player.on_player_event(None)
+
+    mass.create_task.assert_not_called()
+
+
+async def test_a_pause_from_music_assistant_is_resumed_from_the_speaker_too() -> None:
+    """Test the stop we send for a pause still lets the speaker's play button resume the queue."""
+    player, mass, client = _speaker_playing_our_queue()
+    player.mark_stop_called = MagicMock()  # type: ignore[misc, method-assign]
+    player._state = MagicMock(active_source="sonos_player")
+    mass.player_queues.get.return_value = MagicMock()
+    client.player.is_passive = False
+    client.player.group.stop = AsyncMock()
+
+    await player.pause()
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PAUSED, 1300.0)
+    player.on_player_event(None)
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 1300.0)
+    player.on_player_event(None)
+
+    client.player.group.stop.assert_awaited_once()
+    await _run_scheduled_resume(mass)
+    mass.player_queues.resume.assert_awaited_once_with("sonos_player")
+
+
+async def test_a_stop_forgets_the_paused_queue() -> None:
+    """Test the speaker's play button does not bring back a queue that was stopped."""
+    player, mass, client = _speaker_playing_our_queue()
+    player.mark_stop_called = MagicMock()  # type: ignore[misc, method-assign]
+    client.player.is_passive = False
+    client.player.group.stop = AsyncMock()
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PAUSED, 1300.0)
+    player.on_player_event(None)
+
+    await player.stop()
+    _report_our_queue(client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 1300.0)
+    player.on_player_event(None)
+
+    mass.create_task.assert_not_called()
+
+
+def test_a_group_member_follows_its_coordinator_handing_over_a_resume() -> None:
+    """Test only the coordinator resumes the queue, while its members report it paused."""
+    player, mass, client = _connected_player()
+    player._attr_playback_state = PlaybackState.IDLE
+    player._paused_queue_id = "sonos_leader"
+    client.player.is_coordinator = False
+    client.player.group.coordinator_id = "sonos_leader"
+    group_parent = MagicMock()
+    group_parent._device_resume_pending = True
+    _report_our_queue(
+        group_parent.client.player.group, SonosPlayBackState.PLAYBACK_STATE_PLAYING, 1300.0
+    )
+    mass.players.get_player.return_value = group_parent
+
+    player.on_player_event(None)
+
+    assert player._attr_playback_state is PlaybackState.IDLE
+    mass.create_task.assert_not_called()
